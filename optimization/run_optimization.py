@@ -23,7 +23,7 @@ def get_lr(t, initial_lr, rampdown=0.25, rampup=0.05):
 
     return initial_lr * lr_ramp
 
-def run_optimization(args, loss_config, latent_code_init, img_orig, g_ema, clip_loss, id_loss):
+def run_optimization(args, loss_config, latent_code_init, img_orig, g_ema, clip_loss, id_loss, text_inputs):
     if args.work_in_stylespace:
         with torch.no_grad():
             _, _, latent_code_init = g_ema([latent_code_init], input_is_latent=True, return_latents=True)
@@ -131,7 +131,7 @@ def main(args):
     
     for config in loss_configs:
         print(f"\nRunning optimization with {config} loss configuration...")
-        img_gen, metrics = run_optimization(args, config, latent_code_init, img_orig, g_ema, clip_loss, id_loss)
+        img_gen, metrics = run_optimization(args, config, latent_code_init, img_orig, g_ema, clip_loss, id_loss, text_inputs)
         
         # Save the generated image
         if args.mode == "edit":
