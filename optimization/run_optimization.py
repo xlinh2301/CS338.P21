@@ -77,9 +77,11 @@ def main(args):
         img_gen, _ = g_ema([latent], input_is_latent=True, randomize_noise=False, input_is_stylespace=args.work_in_stylespace)
 
         c_loss = clip_loss(img_gen, text_inputs)
+        c_loss = c_loss.mean()
 
         if args.id_lambda > 0:
             i_loss = id_loss(img_gen, img_orig)[0]
+            i_loss = i_loss.mean()
         else:
             i_loss = 0
 
