@@ -13,9 +13,7 @@ from mapper.training.train_utils import STYLESPACE_DIMENSIONS
 from models.stylegan2.model import Generator
 import clip
 from utils import ensure_checkpoint_exists
-import torch
 
-torch.cuda.empty_cache()
 STYLESPACE_INDICES_WITHOUT_TORGB = [i for i in range(len(STYLESPACE_DIMENSIONS)) if i not in list(range(1, len(STYLESPACE_DIMENSIONS), 3))]
 
 def get_lr(t, initial_lr, rampdown=0.25, rampup=0.05):
@@ -27,9 +25,6 @@ def get_lr(t, initial_lr, rampdown=0.25, rampup=0.05):
 
 
 def main(args):
-    # Clear cache at start
-    torch.cuda.empty_cache()
-    
     ensure_checkpoint_exists(args.ckpt)
     text_inputs = torch.cat([clip.tokenize(args.description)]).cuda()
     os.makedirs(args.results_dir, exist_ok=True)
@@ -38,12 +33,7 @@ def main(args):
     g_ema.load_state_dict(torch.load(args.ckpt)["g_ema"], strict=False)
     g_ema.eval()
     g_ema = g_ema.cuda()
-    
-    with torch.no_grad():
-        mean_latent = g_ema.mean_latent(4096)
-    
-    # Clear cache after loading model and computing mean latent
-    torch.cuda.empty_cache()
+    mean_latent = g_ema.mean_latent(4096)
 
     if args.latent_path:
         latent_code_init = torch.load(args.latent_path).cuda()
@@ -84,9 +74,6 @@ def main(args):
         lr = get_lr(t, args.lr)
         optimizer.param_groups[0]["lr"] = lr
 
-        # Clear cache before forward pass
-        torch.cuda.empty_cache()
-        
         img_gen, _ = g_ema([latent], input_is_latent=True, randomize_noise=False, input_is_stylespace=args.work_in_stylespace)
 
         c_loss = clip_loss(img_gen, text_inputs)
@@ -98,11 +85,9 @@ def main(args):
 
         if args.mode == "edit":
             if args.work_in_stylespace:
-                with torch.no_grad():
-                    l2_loss = sum([((latent_code_init[c] - latent[c]) ** 2).sum() for c in range(len(latent_code_init))])
+                l2_loss = sum([((latent_code_init[c] - latent[c]) ** 2).sum() for c in range(len(latent_code_init))])
             else:
-                with torch.no_grad():
-                    l2_loss = ((latent_code_init - latent) ** 2).sum()
+                l2_loss = ((latent_code_init - latent) ** 2).sum()
             loss = c_loss + args.l2_lambda * l2_loss + args.id_lambda * i_loss
         else:
             loss = c_loss
@@ -110,9 +95,6 @@ def main(args):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
-        # Clear cache after backward pass
-        torch.cuda.empty_cache()
 
         pbar.set_description(
             (
@@ -126,15 +108,10 @@ def main(args):
             torchvision.utils.save_image(img_gen, f"results/{str(i).zfill(5)}.jpg", normalize=True, value_range=(-1, 1))
 
     if args.mode == "edit":
-        with torch.no_grad():
-            final_result = torch.cat([img_orig, img_gen])
+        final_result = torch.cat([img_orig, img_gen])
     else:
-        with torch.no_grad():
-            final_result = img_gen
+        final_result = img_gen
 
-    # Final cache clear
-    torch.cuda.empty_cache()
-    
     return final_result
 
 
