@@ -1,7 +1,7 @@
 import argparse
 import math
 import os
-import pandas as pd
+
 import torch
 import torchvision
 from torch import optim
@@ -23,81 +23,6 @@ def get_lr(t, initial_lr, rampdown=0.25, rampup=0.05):
 
     return initial_lr * lr_ramp
 
-def run_optimization(args, loss_config, latent_code_init, img_orig, g_ema, clip_loss, id_loss, text_inputs):
-    if args.work_in_stylespace:
-        with torch.no_grad():
-            _, _, latent_code_init = g_ema([latent_code_init], input_is_latent=True, return_latents=True)
-        latent = [s.detach().clone() for s in latent_code_init]
-        for c, s in enumerate(latent):
-            if c in STYLESPACE_INDICES_WITHOUT_TORGB:
-                s.requires_grad = True
-    else:
-        latent = latent_code_init.detach().clone()
-        latent.requires_grad = True
-
-    if args.work_in_stylespace:
-        optimizer = optim.Adam(latent, lr=args.lr)
-    else:
-        optimizer = optim.Adam([latent], lr=args.lr)
-
-    pbar = tqdm(range(args.step))
-    metrics = {
-        'clip_loss': [],
-        'l2_loss': [],
-        'id_loss': [],
-        'total_loss': []
-    }
-
-    for i in pbar:
-        t = i / args.step
-        lr = get_lr(t, args.lr)
-        optimizer.param_groups[0]["lr"] = lr
-
-        img_gen, _ = g_ema([latent], input_is_latent=True, randomize_noise=False, input_is_stylespace=args.work_in_stylespace)
-
-        c_loss = clip_loss(img_gen, text_inputs)
-        c_loss = c_loss.mean()
-        metrics['clip_loss'].append(c_loss.item())
-
-        if loss_config in ['id_only', 'all'] and args.id_lambda > 0:
-            i_loss = id_loss(img_gen, img_orig)[0]
-            metrics['id_loss'].append(i_loss.item())
-        else:
-            i_loss = 0
-            metrics['id_loss'].append(0)
-
-        if args.mode == "edit":
-            if args.work_in_stylespace:
-                l2_loss = sum([((latent_code_init[c] - latent[c]) ** 2).sum() for c in range(len(latent_code_init))])
-            else:
-                l2_loss = ((latent_code_init - latent) ** 2).sum()
-            metrics['l2_loss'].append(l2_loss.item())
-        else:
-            l2_loss = 0
-            metrics['l2_loss'].append(0)
-
-        if loss_config == 'clip_only':
-            loss = c_loss
-        elif loss_config == 'l2_only':
-            loss = c_loss + args.l2_lambda * l2_loss
-        elif loss_config == 'id_only':
-            loss = c_loss + args.id_lambda * i_loss
-        else:  # all
-            loss = c_loss + args.l2_lambda * l2_loss + args.id_lambda * i_loss
-
-        metrics['total_loss'].append(loss.item())
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        pbar.set_description(
-            (
-                f"loss: {loss.item():.4f};"
-            )
-        )
-
-    return img_gen, metrics
 
 def main(args):
     ensure_checkpoint_exists(args.ckpt)
@@ -123,49 +48,69 @@ def main(args):
     with torch.no_grad():
         img_orig, _ = g_ema([latent_code_init], input_is_latent=True, randomize_noise=False)
 
+    if args.work_in_stylespace:
+        with torch.no_grad():
+            _, _, latent_code_init = g_ema([latent_code_init], input_is_latent=True, return_latents=True)
+        latent = [s.detach().clone() for s in latent_code_init]
+        for c, s in enumerate(latent):
+            if c in STYLESPACE_INDICES_WITHOUT_TORGB:
+                s.requires_grad = True
+    else:
+        latent = latent_code_init.detach().clone()
+        latent.requires_grad = True
+
     clip_loss = CLIPLoss(args)
     id_loss = IDLoss(args)
 
-    # Run optimization with different loss configurations
-    loss_configs = ['clip_only', 'l2_only', 'id_only']
-    results = {}
-    
-    for config in loss_configs:
-        print(f"\nRunning optimization with {config} loss configuration...")
-        img_gen, metrics = run_optimization(args, config, latent_code_init, img_orig, g_ema, clip_loss, id_loss, text_inputs)
-        
-        # Save the generated image
-        if args.mode == "edit":
-            final_result = torch.cat([img_orig, img_gen])
-        else:
-            final_result = img_gen
-            
-        torchvision.utils.save_image(
-            final_result.detach().cpu(), 
-            os.path.join(args.results_dir, f"final_result_{config}.jpg"), 
-            normalize=True, 
-            scale_each=True, 
-            value_range=(-1, 1)
-        )
-        
-        # Store metrics
-        results[config] = {
-            'final_clip_loss': metrics['clip_loss'][-1],
-            'final_l2_loss': metrics['l2_loss'][-1],
-            'final_id_loss': metrics['id_loss'][-1],
-            'final_total_loss': metrics['total_loss'][-1],
-            'min_clip_loss': min(metrics['clip_loss']),
-            'min_l2_loss': min(metrics['l2_loss']),
-            'min_id_loss': min(metrics['id_loss']),
-            'min_total_loss': min(metrics['total_loss'])
-        }
+    if args.work_in_stylespace:
+        optimizer = optim.Adam(latent, lr=args.lr)
+    else:
+        optimizer = optim.Adam([latent], lr=args.lr)
 
-    # Create and save results table
-    df = pd.DataFrame(results).T
-    print("\nResults Summary:")
-    print(df)
-    df.to_csv(os.path.join(args.results_dir, 'loss_comparison_results.csv'))
-    print(f"\nResults saved to {os.path.join(args.results_dir, 'loss_comparison_results.csv')}")
+    pbar = tqdm(range(args.step))
+
+    for i in pbar:
+        t = i / args.step
+        lr = get_lr(t, args.lr)
+        optimizer.param_groups[0]["lr"] = lr
+
+        img_gen, _ = g_ema([latent], input_is_latent=True, randomize_noise=False, input_is_stylespace=args.work_in_stylespace)
+
+        c_loss = clip_loss(img_gen, text_inputs)
+
+        if args.id_lambda > 0:
+            i_loss = id_loss(img_gen, img_orig)[0]
+        else:
+            i_loss = 0
+
+        if args.mode == "edit":
+            if args.work_in_stylespace:
+                l2_loss = sum([((latent_code_init[c] - latent[c]) ** 2).sum() for c in range(len(latent_code_init))])
+            else:
+                l2_loss = ((latent_code_init - latent) ** 2).sum()
+            loss = c_loss + args.l2_lambda * l2_loss + args.id_lambda * i_loss
+        else:
+            loss = c_loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        pbar.set_description(
+            (
+                f"loss: {loss.item():.4f};"
+            )
+        )
+        if args.save_intermediate_image_every > 0 and i % args.save_intermediate_image_every == 0:
+            with torch.no_grad():
+                img_gen, _ = g_ema([latent], input_is_latent=True, randomize_noise=False, input_is_stylespace=args.work_in_stylespace)
+
+            torchvision.utils.save_image(img_gen, f"results/{str(i).zfill(5)}.jpg", normalize=True, value_range=(-1, 1))
+
+    if args.mode == "edit":
+        final_result = torch.cat([img_orig, img_gen])
+    else:
+        final_result = img_gen
 
     return final_result
 
