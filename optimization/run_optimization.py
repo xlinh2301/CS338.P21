@@ -1,11 +1,10 @@
 import argparse
 import math
 import os
-
+import pandas as pd
 import torch
 import torchvision
 from torch import optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 from criteria.clip_loss import CLIPLoss
@@ -24,6 +23,80 @@ def get_lr(t, initial_lr, rampdown=0.25, rampup=0.05):
 
     return initial_lr * lr_ramp
 
+def run_optimization(args, loss_config, latent_code_init, img_orig, g_ema, clip_loss, id_loss):
+    if args.work_in_stylespace:
+        with torch.no_grad():
+            _, _, latent_code_init = g_ema([latent_code_init], input_is_latent=True, return_latents=True)
+        latent = [s.detach().clone() for s in latent_code_init]
+        for c, s in enumerate(latent):
+            if c in STYLESPACE_INDICES_WITHOUT_TORGB:
+                s.requires_grad = True
+    else:
+        latent = latent_code_init.detach().clone()
+        latent.requires_grad = True
+
+    if args.work_in_stylespace:
+        optimizer = optim.Adam(latent, lr=args.lr)
+    else:
+        optimizer = optim.Adam([latent], lr=args.lr)
+
+    pbar = tqdm(range(args.step))
+    metrics = {
+        'clip_loss': [],
+        'l2_loss': [],
+        'id_loss': [],
+        'total_loss': []
+    }
+
+    for i in pbar:
+        t = i / args.step
+        lr = get_lr(t, args.lr)
+        optimizer.param_groups[0]["lr"] = lr
+
+        img_gen, _ = g_ema([latent], input_is_latent=True, randomize_noise=False, input_is_stylespace=args.work_in_stylespace)
+
+        c_loss = clip_loss(img_gen, text_inputs)
+        metrics['clip_loss'].append(c_loss.item())
+
+        if loss_config in ['id_only', 'all'] and args.id_lambda > 0:
+            i_loss = id_loss(img_gen, img_orig)[0]
+            metrics['id_loss'].append(i_loss.item())
+        else:
+            i_loss = 0
+            metrics['id_loss'].append(0)
+
+        if args.mode == "edit":
+            if args.work_in_stylespace:
+                l2_loss = sum([((latent_code_init[c] - latent[c]) ** 2).sum() for c in range(len(latent_code_init))])
+            else:
+                l2_loss = ((latent_code_init - latent) ** 2).sum()
+            metrics['l2_loss'].append(l2_loss.item())
+        else:
+            l2_loss = 0
+            metrics['l2_loss'].append(0)
+
+        if loss_config == 'clip_only':
+            loss = c_loss
+        elif loss_config == 'l2_only':
+            loss = c_loss + args.l2_lambda * l2_loss
+        elif loss_config == 'id_only':
+            loss = c_loss + args.id_lambda * i_loss
+        else:  # all
+            loss = c_loss + args.l2_lambda * l2_loss + args.id_lambda * i_loss
+
+        metrics['total_loss'].append(loss.item())
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        pbar.set_description(
+            (
+                f"loss: {loss.item():.4f};"
+            )
+        )
+
+    return img_gen, metrics
 
 def main(args):
     ensure_checkpoint_exists(args.ckpt)
@@ -49,75 +122,49 @@ def main(args):
     with torch.no_grad():
         img_orig, _ = g_ema([latent_code_init], input_is_latent=True, randomize_noise=False)
 
-    if args.work_in_stylespace:
-        with torch.no_grad():
-            _, _, latent_code_init = g_ema([latent_code_init], input_is_latent=True, return_latents=True)
-        latent = [s.detach().clone() for s in latent_code_init]
-        for c, s in enumerate(latent):
-            if c in STYLESPACE_INDICES_WITHOUT_TORGB:
-                s.requires_grad = True
-    else:
-        latent = latent_code_init.detach().clone()
-        latent.requires_grad = True
-
     clip_loss = CLIPLoss(args)
     id_loss = IDLoss(args)
 
-    if args.work_in_stylespace:
-        optimizer = optim.AdamW([latent], lr=args.lr, weight_decay=0.01)
-    else:
-        optimizer = optim.AdamW([latent], lr=args.lr, weight_decay=0.01)
+    # Run optimization with different loss configurations
+    loss_configs = ['clip_only', 'l2_only', 'id_only']
+    results = {}
     
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.step, eta_min=args.lr/10)
-
-    pbar = tqdm(range(args.step))
-
-    accumulation_steps = 4  # Tích lũy gradient qua 4 bước
-    for i in pbar:
-        t = i / args.step
-        lr = get_lr(t, args.lr)
-        optimizer.param_groups[0]["lr"] = lr
-
-        img_gen, _ = g_ema([latent], input_is_latent=True, randomize_noise=False, input_is_stylespace=args.work_in_stylespace)
-
-        c_loss = clip_loss(img_gen, text_inputs)
-
-        if args.id_lambda > 0:
-            i_loss = id_loss(img_gen, img_orig)[0]
-        else:
-            i_loss = 0
-
-        if args.mode == "edit":
-            if args.work_in_stylespace:
-                l2_loss = sum([((latent_code_init[c] - latent[c]) ** 2).sum() for c in range(len(latent_code_init))])
-            else:
-                l2_loss = ((latent_code_init - latent) ** 2).sum()
-            loss = c_loss + args.l2_lambda * l2_loss + args.id_lambda * i_loss
-        else:
-            loss = c_loss
-
-        loss = loss / accumulation_steps  # Chia loss
-        loss.backward()
+    for config in loss_configs:
+        print(f"\nRunning optimization with {config} loss configuration...")
+        img_gen, metrics = run_optimization(args, config, latent_code_init, img_orig, g_ema, clip_loss, id_loss)
         
-        if (i + 1) % accumulation_steps == 0:
-            optimizer.step()
-            optimizer.zero_grad()
-
-        pbar.set_description(
-            (
-                f"loss: {loss.item():.4f}; lr: {scheduler.get_last_lr()[0]:.4f}"
-            )
+        # Save the generated image
+        if args.mode == "edit":
+            final_result = torch.cat([img_orig, img_gen])
+        else:
+            final_result = img_gen
+            
+        torchvision.utils.save_image(
+            final_result.detach().cpu(), 
+            os.path.join(args.results_dir, f"final_result_{config}.jpg"), 
+            normalize=True, 
+            scale_each=True, 
+            value_range=(-1, 1)
         )
-        if args.save_intermediate_image_every > 0 and i % args.save_intermediate_image_every == 0:
-            with torch.no_grad():
-                img_gen, _ = g_ema([latent], input_is_latent=True, randomize_noise=False, input_is_stylespace=args.work_in_stylespace)
+        
+        # Store metrics
+        results[config] = {
+            'final_clip_loss': metrics['clip_loss'][-1],
+            'final_l2_loss': metrics['l2_loss'][-1],
+            'final_id_loss': metrics['id_loss'][-1],
+            'final_total_loss': metrics['total_loss'][-1],
+            'min_clip_loss': min(metrics['clip_loss']),
+            'min_l2_loss': min(metrics['l2_loss']),
+            'min_id_loss': min(metrics['id_loss']),
+            'min_total_loss': min(metrics['total_loss'])
+        }
 
-            torchvision.utils.save_image(img_gen, f"results/{str(i).zfill(5)}.jpg", normalize=True, value_range=(-1, 1))
-
-    if args.mode == "edit":
-        final_result = torch.cat([img_orig, img_gen])
-    else:
-        final_result = img_gen
+    # Create and save results table
+    df = pd.DataFrame(results).T
+    print("\nResults Summary:")
+    print(df)
+    df.to_csv(os.path.join(args.results_dir, 'loss_comparison_results.csv'))
+    print(f"\nResults saved to {os.path.join(args.results_dir, 'loss_comparison_results.csv')}")
 
     return final_result
 
@@ -125,23 +172,23 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--description", type=str, default="a person with no hair", help="the text that guides the editing/generation")
+    parser.add_argument("--description", type=str, default="a person with purple hair", help="the text that guides the editing/generation")
     parser.add_argument("--ckpt", type=str, default="./pretrained_models/stylegan2-ffhq-config-f.pt", help="pretrained StyleGAN2 weights")
     parser.add_argument("--stylegan_size", type=int, default=1024, help="StyleGAN resolution")
     parser.add_argument("--lr_rampup", type=float, default=0.05)
     parser.add_argument("--lr", type=float, default=0.1)
-    parser.add_argument("--step", type=int, default=20, help="number of optimization steps")
+    parser.add_argument("--step", type=int, default=300, help="number of optimization steps")
     parser.add_argument("--mode", type=str, default="edit", choices=["edit", "free_generation"], help="choose between edit an image an generate a free one")
-    parser.add_argument("--l2_lambda", type=float, default=0.01, help="weight of the latent distance (used for editing only)")
+    parser.add_argument("--l2_lambda", type=float, default=0.008, help="weight of the latent distance (used for editing only)")
     parser.add_argument("--id_lambda", type=float, default=0.000, help="weight of id loss (used for editing only)")
-    parser.add_argument("--latent_path", type=str, default=None, help="starts the optimization from the given latent code if provided. Otherwose, starts from"
+    parser.add_argument("--latent_path", type=str, default="./pretrained_models/example_celebs.pt", help="starts the optimization from the given latent code if provided. Otherwose, starts from"
                                                                       "the mean latent in a free generation, and from a random one in editing. "
                                                                       "Expects a .pt format")
     parser.add_argument("--truncation", type=float, default=0.7, help="used only for the initial latent vector, and only when a latent code path is"
                                                                       "not provided")
     parser.add_argument('--work_in_stylespace', default=False, action='store_true')
     parser.add_argument("--save_intermediate_image_every", type=int, default=20, help="if > 0 then saves intermidate results during the optimization")
-    parser.add_argument("--results_dir", type=str, default="experiments/optimization_results")
+    parser.add_argument("--results_dir", type=str, default="results")
     parser.add_argument('--ir_se50_weights', default='./pretrained_models/model_ir_se50.pth', type=str,
                              help="Path to facial recognition network used in ID loss")
 
@@ -150,3 +197,4 @@ if __name__ == "__main__":
     result_image = main(args)
 
     torchvision.utils.save_image(result_image.detach().cpu(), os.path.join(args.results_dir, "final_result.jpg"), normalize=True, scale_each=True, value_range=(-1, 1))
+
