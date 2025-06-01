@@ -56,7 +56,7 @@ def run_optimization(args, loss_config, latent_code_init, img_orig, g_ema, clip_
         img_gen, _ = g_ema([latent], input_is_latent=True, randomize_noise=False, input_is_stylespace=args.work_in_stylespace)
 
         c_loss = clip_loss(img_gen, text_inputs)
-        metrics['clip_loss'].append(c_loss.item())
+        metrics['clip_loss'].append(c_loss.mean().item())
 
         if loss_config in ['id_only', 'all'] and args.id_lambda > 0:
             i_loss = id_loss(img_gen, img_orig)[0]
